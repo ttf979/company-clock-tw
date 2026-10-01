@@ -29,10 +29,17 @@ export default async function hall(req:Request,path:string){
   if(path==='transfer'){if(p.status!=='room')return reply({error:'目前已是轉台中'},409);p.status='transfer';p.awayAt=now;p.events.push({type:'轉台',at:now});}
   if(path==='return'){if(p.status!=='transfer')return reply({error:'目前不是轉台中'},409);p.events.push({type:'回台',at:now,awayMs:now-p.awayAt});p.status='room';p.awayAt=null;}
   if(path==='out'){const record=finish(p,now);data.history.unshift(record);delete data.active[b.id];output.record=record;}
+ }else if(path==='settle'){
+  const record=data.history.find((h:any)=>h.id===b.id);if(!record)return reply({error:'請先結束服務，再結帳'},409);
+  const previous=data.receipts.find((r:any)=>r.records.some((h:any)=>h.id===record.id));
+  if(previous)return reply({ok:true,receipt:previous,alreadySettled:true});
+  const receipt={id:randomBytes(12).toString('hex'),guestId:record.guestId,name:record.guestName,room:record.room,at:now,total:record.pay,records:[record],kind:'service'};
+  record.settledAt=now;record.receiptId=receipt.id;data.receipts.unshift(receipt);output.receipt=receipt;
  }else if(path==='checkout'){
   const guest=data.guests.find((g:any)=>g.id===b.guestId);if(!guest||guest.closedAt)return reply({error:'此客人已結帳或不存在'},409);
   for(const p of Object.values(data.active) as any[]){if(p.guestId===guest.id){data.history.unshift(finish(p,now));delete data.active[p.id];}}
-  const records=data.history.filter((h:any)=>h.guestId===guest.id);guest.closedAt=now;const receipt={id:randomBytes(12).toString('hex'),guestId:guest.id,name:guest.name,room:guest.room,at:now,total:records.reduce((sum:number,h:any)=>sum+h.pay,0),records};data.receipts.unshift(receipt);output.receipt=receipt;
+  const settledIds=new Set(data.receipts.flatMap((r:any)=>r.records.map((h:any)=>h.id)));
+  const records=data.history.filter((h:any)=>h.guestId===guest.id&&!settledIds.has(h.id));guest.closedAt=now;const receipt={id:randomBytes(12).toString('hex'),guestId:guest.id,name:guest.name,room:guest.room,at:now,total:records.reduce((sum:number,h:any)=>sum+h.pay,0),records};for(const record of records){record.settledAt=now;record.receiptId=receipt.id;}data.receipts.unshift(receipt);output.receipt=receipt;
  }else return reply({error:'找不到功能'},404);
  const write=await db.setJSON('hall',data,result?.etag?{onlyIfMatch:result.etag}:{onlyIfNew:true});if(!write.modified)return reply({error:'其他人剛更新資料，已重新整理，請再按一次'},409);return reply(output);
 }
