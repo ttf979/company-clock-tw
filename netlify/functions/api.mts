@@ -1,14 +1,14 @@
 import type { Config, Context } from "@netlify/functions";
 import { getStore } from "@netlify/blobs";
-import { randomBytes, scryptSync, timingSafeEqual, createHmac } from "node:crypto";
+import { randomBytes, scryptSync, timingSafeEqual, createHash } from "node:crypto";
 
 const RATE = 600;
 const UNIT_MIN = 30;
 const SESSION_TTL = 60 * 60 * 24 * 30;
 
-function accountsStore(){ return getStore("clock-accounts", { consistency: "strong" }); }
-function dataStore(){ return getStore("clock-data", { consistency: "strong" }); }
-function secret(){ return Netlify.env.get("CLOCK_SESSION_SECRET") || ""; }
+function accountsStore(){ return getStore({ name:"clock-accounts", consistency: "strong" }); }
+function dataStore(){ return getStore({ name:"clock-data", consistency: "strong" }); }
+function sessionsStore(){ return getStore({ name:"clock-sessions", consistency: "strong" }); }
 function json(data: unknown, status=200, headers: HeadersInit={}){
   return new Response(JSON.stringify(data), {status, headers:{"content-type":"application/json; charset=utf-8", ...headers}});
 }
@@ -19,21 +19,21 @@ function hashPassword(password:string, salt=randomBytes(16).toString("hex")){
 function verifyPassword(password:string,salt:string,hash:string){
   const a=Buffer.from(hash,"hex"), b=scryptSync(password,salt,64); return a.length===b.length && timingSafeEqual(a,b);
 }
-function sign(payload:string){ return createHmac("sha256",secret()).update(payload).digest("base64url"); }
-function issueSession(companyId:string){
-  const payload=Buffer.from(JSON.stringify({companyId,exp:Math.floor(Date.now()/1000)+SESSION_TTL})).toString("base64url");
-  return payload+"."+sign(payload);
+function sessionKey(token:string){ return createHash("sha256").update(token).digest("hex"); }
+async function issueSession(companyId:string){
+  const token=randomBytes(32).toString("base64url");
+  await sessionsStore().setJSON(sessionKey(token),{companyId,exp:Math.floor(Date.now()/1000)+SESSION_TTL});
+  return token;
 }
 function parseCookies(req:Request){
   const out:Record<string,string>={}; const raw=req.headers.get("cookie")||"";
   raw.split(";").forEach(p=>{ const i=p.indexOf("="); if(i>0) out[p.slice(0,i).trim()]=decodeURIComponent(p.slice(i+1).trim()); }); return out;
 }
-function getSession(req:Request){
-  const token=parseCookies(req).clock_session; if(!token || !secret()) return null;
-  const [payload,sig]=token.split("."); if(!payload||!sig) return null;
-  const expected=Buffer.from(sign(payload)); const actual=Buffer.from(sig);
-  if(expected.length!==actual.length || !timingSafeEqual(expected,actual)) return null;
-  try{ const obj=JSON.parse(Buffer.from(payload,"base64url").toString()); if(obj.exp<Date.now()/1000) return null; return obj; }catch{return null;}
+async function getSession(req:Request){
+  const token=parseCookies(req).clock_session; if(!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+  const obj:any=await sessionsStore().get(sessionKey(token),{type:"json"});
+  if(!obj || obj.exp<=Date.now()/1000) return null;
+  return obj;
 }
 function sessionCookie(token:string){ return `clock_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL}`; }
 function clearCookie(){ return "clock_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"; }
@@ -43,10 +43,9 @@ async function getTenant(companyId:string){
   return (await dataStore().get(`tenant/${companyId}`, {type:"json"})) || { employees:[], active:{}, history:[] };
 }
 async function saveTenant(companyId:string,data:any){ await dataStore().setJSON(`tenant/${companyId}`,data); }
-function requireSession(req:Request){ const s=getSession(req); if(!s) throw new Response(JSON.stringify({error:"尚未登入"}),{status:401,headers:{"content-type":"application/json"}}); return s; }
+async function requireSession(req:Request){ const s=await getSession(req); if(!s) throw new Response(JSON.stringify({error:"尚未登入"}),{status:401,headers:{"content-type":"application/json"}}); return s; }
 
 export default async (req: Request, context: Context) => {
-  if(!secret()) return json({error:"伺服器尚未設定 CLOCK_SESSION_SECRET"},500);
   const url=new URL(req.url); const path=url.pathname.replace(/^\/api\/?/,"");
   try{
     if(path==="register" && req.method==="POST"){
@@ -56,19 +55,23 @@ export default async (req: Request, context: Context) => {
       const companyId=randomBytes(12).toString("hex"); const hp=hashPassword(password); const now=new Date().toISOString();
       await a.set(`code/${companyCode}`,companyId); await a.setJSON(`company/${companyId}`,{companyId,companyCode,companyName,...hp,createdAt:now});
       await saveTenant(companyId,{employees:[],active:{},history:[]});
-      return json({ok:true,company:{companyCode,companyName} },201,{"set-cookie":sessionCookie(issueSession(companyId))});
+      return json({ok:true,company:{companyCode,companyName} },201,{"set-cookie":sessionCookie(await issueSession(companyId))});
     }
     if(path==="login" && req.method==="POST"){
       const b:any=await body(req); const companyCode=cleanCode(b.companyCode); const password=String(b.password||""); const a=accountsStore(); const companyId=await a.get(`code/${companyCode}`);
       if(!companyId) return json({error:"公司代號或密碼錯誤"},401); const c:any=await getCompany(companyId); if(!c || !verifyPassword(password,c.salt,c.hash)) return json({error:"公司代號或密碼錯誤"},401);
-      return json({ok:true,company:{companyCode:c.companyCode,companyName:c.companyName}},200,{"set-cookie":sessionCookie(issueSession(companyId))});
+      return json({ok:true,company:{companyCode:c.companyCode,companyName:c.companyName}},200,{"set-cookie":sessionCookie(await issueSession(companyId))});
     }
-    if(path==="logout" && req.method==="POST") return json({ok:true},200,{"set-cookie":clearCookie()});
+    if(path==="logout" && req.method==="POST") {
+      const token=parseCookies(req).clock_session;
+      if(token && /^[A-Za-z0-9_-]{43}$/.test(token)) await sessionsStore().delete(sessionKey(token));
+      return json({ok:true},200,{"set-cookie":clearCookie()});
+    }
     if(path==="me" && req.method==="GET"){
-      const s=requireSession(req); const c:any=await getCompany(s.companyId); return json({company:{companyCode:c.companyCode,companyName:c.companyName},rate:RATE,unitMin:UNIT_MIN});
+      const s=await requireSession(req); const c:any=await getCompany(s.companyId); return json({company:{companyCode:c.companyCode,companyName:c.companyName},rate:RATE,unitMin:UNIT_MIN});
     }
 
-    const s=requireSession(req); const companyId=s.companyId; const tenant:any=await getTenant(companyId);
+    const s=await requireSession(req); const companyId=s.companyId; const tenant:any=await getTenant(companyId);
     if(path==="state" && req.method==="GET") return json({...tenant,serverNow:Date.now(),rate:RATE,unitMin:UNIT_MIN});
     if(path==="employees" && req.method==="POST"){
       const b:any=await body(req); const code=cleanCode(b.code); if(!code) return json({error:"請輸入員工代號"},400);

@@ -2,7 +2,7 @@
   "name":"company-clock",
   "private":true,
   "type":"module",
-  "scripts":{"dev":"netlify dev"},
-  "dependencies":{"@netlify/blobs":"latest","@netlify/functions":"latest"},
-  "devDependencies":{"netlify-cli":"latest"}
+  "scripts":{"dev":"npx netlify-cli dev"},
+  "engines":{"node":">=22"},
+  "dependencies":{"@netlify/blobs":"11.1.3","@netlify/functions":"6.0.2"}
 }
