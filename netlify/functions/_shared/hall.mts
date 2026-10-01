@@ -11,10 +11,18 @@ export default async function hall(req:Request,path:string){
  let b:any;try{b=await req.json()}catch{return reply({error:'資料格式錯誤'},400)}const now=Date.now();let output:any={ok:true};
  if(path==='guest'){
   const name=text(b.name),room=text(b.room);if(!name||!room)return reply({error:'請填入客人稱呼與包廂'},400);
+  const existing=data.guests.find((g:any)=>!g.closedAt&&g.name===name&&g.room===room); if(existing)return reply({ok:true,guest:existing});
   const guest={id:randomBytes(12).toString('hex'),name,room,createdAt:now,closedAt:null};data.guests.unshift(guest);output.guest=guest;
  }else if(path==='start'){
-  const guest=data.guests.find((g:any)=>g.id===b.guestId&&!g.closedAt),employee=text(b.employee);if(!guest||!employee)return reply({error:'請選擇未結帳客人，並填入小姐稱呼'},400);
-  if(Object.values(data.active).some((p:any)=>p.guestId===guest.id&&p.employee===employee))return reply({error:'這位小姐已在此客人名下上班'},409);
+  const employee=text(b.employee);if(!employee)return reply({error:'請填入小姐稱呼'},400);
+  let guest:any;
+  if(b.guestId){guest=data.guests.find((g:any)=>g.id===b.guestId&&!g.closedAt);if(!guest)return reply({error:'此客人已結帳，請重新選擇'},400);}
+  else {const name=text(b.guestName),room=text(b.room);if(!name||!room)return reply({error:'請填入客人稱呼與包廂'},400);
+   guest=data.guests.find((g:any)=>!g.closedAt&&g.name===name&&g.room===room);
+   if(!guest){guest={id:randomBytes(12).toString('hex'),name,room,createdAt:now,closedAt:null};data.guests.unshift(guest);}}
+  const existing=Object.values(data.active).find((p:any)=>p.guestId===guest.id&&p.employee===employee) as any;
+  if(existing)return reply({ok:true,id:existing.id,guest,alreadyActive:true});
+  output.guest=guest;
   const id=randomBytes(12).toString('hex');data.active[id]={id,guestId:guest.id,guestName:guest.name,room:guest.room,employee,start:now,status:'room',awayAt:null,events:[{type:'上班',at:now}]};output.id=id;
  }else if(['transfer','return','out'].includes(path)){
   const p=data.active[b.id];if(!p)return reply({error:'這筆服務已結束，請重新整理'},409);
