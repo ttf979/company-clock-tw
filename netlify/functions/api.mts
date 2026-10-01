@@ -39,10 +39,16 @@ function sessionCookie(token:string){ return `clock_session=${encodeURIComponent
 function clearCookie(){ return "clock_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"; }
 async function body(req:Request){ try{return await req.json();}catch{return {};}}
 async function getCompany(companyId:string){ return await accountsStore().get(`company/${companyId}`, {type:"json"}); }
+const tenantVersion=Symbol("tenantVersion");
 async function getTenant(companyId:string){
-  return (await dataStore().get(`tenant/${companyId}`, {type:"json"})) || { employees:[], active:{}, history:[] };
+  const result=await dataStore().getWithMetadata(`tenant/${companyId}`,{type:"json"});
+  const data:any=result?.data||{employees:[],active:{},history:[]};
+  data[tenantVersion]=result?.etag; return data;
 }
-async function saveTenant(companyId:string,data:any){ await dataStore().setJSON(`tenant/${companyId}`,data); }
+async function saveTenant(companyId:string,data:any){
+  const etag=data[tenantVersion]; const result=await dataStore().setJSON(`tenant/${companyId}`,data,etag?{onlyIfMatch:etag}:{});
+  if(!result.modified) throw new Response(JSON.stringify({error:"資料剛被更新，請重新操作"}),{status:409,headers:{"content-type":"application/json"}});
+}
 async function requireSession(req:Request){ const s=await getSession(req); if(!s) throw new Response(JSON.stringify({error:"尚未登入"}),{status:401,headers:{"content-type":"application/json"}}); return s; }
 
 export default async (req: Request, context: Context) => {
