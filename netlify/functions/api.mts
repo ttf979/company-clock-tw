@@ -20,9 +20,9 @@ function verifyPassword(password:string,salt:string,hash:string){
   const a=Buffer.from(hash,"hex"), b=scryptSync(password,salt,64); return a.length===b.length && timingSafeEqual(a,b);
 }
 function sessionKey(token:string){ return createHash("sha256").update(token).digest("hex"); }
-async function issueSession(companyId:string){
+async function issueSession(companyId:string, employeeCode?:string){
   const token=randomBytes(32).toString("base64url");
-  await sessionsStore().setJSON(sessionKey(token),{companyId,exp:Math.floor(Date.now()/1000)+SESSION_TTL});
+  await sessionsStore().setJSON(sessionKey(token),{companyId,employeeCode,exp:Math.floor(Date.now()/1000)+SESSION_TTL});
   return token;
 }
 function parseCookies(req:Request){
@@ -62,38 +62,48 @@ export default async (req: Request, context: Context) => {
       if(!companyId) return json({error:"公司代號或密碼錯誤"},401); const c:any=await getCompany(companyId); if(!c || !verifyPassword(password,c.salt,c.hash)) return json({error:"公司代號或密碼錯誤"},401);
       return json({ok:true,company:{companyCode:c.companyCode,companyName:c.companyName}},200,{"set-cookie":sessionCookie(await issueSession(companyId))});
     }
+    if(path==="employee-login" && req.method==="POST"){
+      const b:any=await body(req); const companyId=await accountsStore().get(`code/${cleanCode(b.companyCode)}`); const code=cleanCode(b.code);
+      const a:any=companyId && await accountsStore().get(`employee/${companyId}/${code}`,{type:"json"});
+      if(!a || !verifyPassword(String(b.password||""),a.salt,a.hash)) return json({error:"公司代號、員工代號或密碼錯誤"},401);
+      return json({ok:true},200,{"set-cookie":sessionCookie(await issueSession(companyId,code))});
+    }
     if(path==="logout" && req.method==="POST") {
       const token=parseCookies(req).clock_session;
       if(token && /^[A-Za-z0-9_-]{43}$/.test(token)) await sessionsStore().delete(sessionKey(token));
       return json({ok:true},200,{"set-cookie":clearCookie()});
     }
     if(path==="me" && req.method==="GET"){
-      const s=await requireSession(req); const c:any=await getCompany(s.companyId); return json({company:{companyCode:c.companyCode,companyName:c.companyName},rate:RATE,unitMin:UNIT_MIN});
+      const s=await requireSession(req); const c:any=await getCompany(s.companyId); return json({company:{companyCode:c.companyCode,companyName:c.companyName},employeeCode:s.employeeCode||null,rate:RATE,unitMin:UNIT_MIN});
     }
 
     const s=await requireSession(req); const companyId=s.companyId; const tenant:any=await getTenant(companyId);
-    if(path==="state" && req.method==="GET") return json({...tenant,serverNow:Date.now(),rate:RATE,unitMin:UNIT_MIN});
+    if(path==="state" && req.method==="GET") return json({...(s.employeeCode ? {employees:[s.employeeCode],active:tenant.active[s.employeeCode]?{[s.employeeCode]:tenant.active[s.employeeCode]}:{},history:tenant.history.filter((h:any)=>h.code===s.employeeCode)} : tenant),serverNow:Date.now(),rate:RATE,unitMin:UNIT_MIN});
+    if(s.employeeCode && !["clock-in","transfer","return","clock-out"].includes(path)) return json({error:"員工無權使用此功能"},403);
     if(path==="employees" && req.method==="POST"){
-      const b:any=await body(req); const code=cleanCode(b.code); if(!code) return json({error:"請輸入員工代號"},400);
+      const b:any=await body(req); const code=s.employeeCode||cleanCode(b.code); if(!code) return json({error:"請輸入員工代號"},400);
+      const password=String(b.password||""); if(password.length<6) return json({error:"員工密碼至少6碼"},400);
+      const key=`employee/${companyId}/${code}`; if(await accountsStore().get(key)) return json({error:"此員工帳號已存在"},409);
+      await accountsStore().setJSON(key,{code,...hashPassword(password)});
       if(!tenant.employees.includes(code)) tenant.employees.push(code); await saveTenant(companyId,tenant); return json({ok:true});
     }
     if(path==="clock-in" && req.method==="POST"){
-      const b:any=await body(req); const code=cleanCode(b.code); if(!tenant.employees.includes(code)) tenant.employees.push(code); if(tenant.active[code]) return json({error:"此員工已在上班中"},409);
-      const now=Date.now(); tenant.active[code]={code,start:now,status:"room",roomStartedAt:now,roomAccumMs:0,transferStartedAt:null,transferAccumMs:0}; await saveTenant(companyId,tenant); return json({ok:true});
+      const b:any=await body(req); const code=s.employeeCode||cleanCode(b.code); if(!code) return json({error:"請輸入員工代號"},400); const room=String(b.room||"").trim().slice(0,40),customer=String(b.customer||"").trim().slice(0,60); if(s.employeeCode && (!room||!customer)) return json({error:"請填入包廂與客戶姓名"},400); if(!tenant.employees.includes(code)) tenant.employees.push(code); if(tenant.active[code]) return json({error:"此員工已在上班中"},409);
+      const now=Date.now(); tenant.active[code]={code,room,customer,events:[{type:"上班",at:now}],start:now,status:"room",roomStartedAt:now,roomAccumMs:0,transferStartedAt:null,transferAccumMs:0}; await saveTenant(companyId,tenant); return json({ok:true});
     }
     if(path==="transfer" && req.method==="POST"){
-      const b:any=await body(req); const code=cleanCode(b.code); const p=tenant.active[code]; if(!p || p.status!=="room") return json({error:"目前不是包廂中"},409);
-      const now=Date.now(); p.roomAccumMs += now-p.roomStartedAt; p.roomStartedAt=null; p.transferStartedAt=now; p.status="transfer"; await saveTenant(companyId,tenant); return json({ok:true});
+      const b:any=await body(req); const code=s.employeeCode||cleanCode(b.code); const p=tenant.active[code]; if(!p || p.status!=="room") return json({error:"目前不是包廂中"},409);
+      const now=Date.now(); (p.events ||= []).push({type:"轉台",at:now}); p.roomAccumMs += now-p.roomStartedAt; p.roomStartedAt=null; p.transferStartedAt=now; p.status="transfer"; await saveTenant(companyId,tenant); return json({ok:true});
     }
     if(path==="return" && req.method==="POST"){
-      const b:any=await body(req); const code=cleanCode(b.code); const p=tenant.active[code]; if(!p || p.status!=="transfer") return json({error:"目前不是轉台中"},409);
-      const now=Date.now(); p.transferAccumMs += now-p.transferStartedAt; p.transferStartedAt=null; p.roomStartedAt=now; p.status="room"; await saveTenant(companyId,tenant); return json({ok:true});
+      const b:any=await body(req); const code=s.employeeCode||cleanCode(b.code); const p=tenant.active[code]; if(!p || p.status!=="transfer") return json({error:"目前不是轉台中"},409);
+      const now=Date.now(); (p.events ||= []).push({type:"回台",at:now}); p.transferAccumMs += now-p.transferStartedAt; p.transferStartedAt=null; p.roomStartedAt=now; p.status="room"; await saveTenant(companyId,tenant); return json({ok:true});
     }
     if(path==="clock-out" && req.method==="POST"){
-      const b:any=await body(req); const code=cleanCode(b.code); const p=tenant.active[code]; if(!p) return json({error:"找不到上班紀錄"},404); const end=Date.now();
+      const b:any=await body(req); const code=s.employeeCode||cleanCode(b.code); const p=tenant.active[code]; if(!p) return json({error:"找不到上班紀錄"},404); const end=Date.now();
       let roomMs=p.roomAccumMs, transferMs=p.transferAccumMs; if(p.status==="room"&&p.roomStartedAt) roomMs+=end-p.roomStartedAt; if(p.status==="transfer"&&p.transferStartedAt) transferMs+=end-p.transferStartedAt;
       const totalMs=end-p.start; const totalMin=totalMs/60000; const billMin=Math.max(UNIT_MIN,Math.ceil(totalMin/UNIT_MIN)*UNIT_MIN); const pay=billMin/60*RATE;
-      tenant.history.unshift({id:randomBytes(8).toString("hex"),code,start:p.start,end,totalMs,roomMs,transferMs,billMin,pay}); tenant.history=tenant.history.slice(0,5000); delete tenant.active[code]; await saveTenant(companyId,tenant); return json({ok:true,pay,billMin});
+      tenant.history.unshift({id:randomBytes(8).toString("hex"),code,room:p.room||"",customer:p.customer||"",events:[...(p.events||[]),{type:"下班",at:end}],start:p.start,end,totalMs,roomMs,transferMs,billMin,pay}); tenant.history=tenant.history.slice(0,5000); delete tenant.active[code]; await saveTenant(companyId,tenant); return json({ok:true,pay,billMin});
     }
     return json({error:"找不到功能"},404);
   } catch(err:any){ if(err instanceof Response) return err; console.error(err); return json({error:"伺服器錯誤"},500); }
