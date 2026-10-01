@@ -1,3 +1,4 @@
+import hall from "./_shared/hall.mts";
 import type { Config, Context } from "@netlify/functions";
 import { getStore } from "@netlify/blobs";
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from "node:crypto";
@@ -54,6 +55,7 @@ async function requireSession(req:Request){ const s=await getSession(req); if(!s
 export default async (req: Request, context: Context) => {
   const url=new URL(req.url); const path=url.pathname.replace(/^\/api\/?/,"");
   try{
+    if(path.startsWith("hall/")) return await hall(req,path.slice(5));
     if(path==="register" && req.method==="POST"){
       const b:any=await body(req); const companyCode=cleanCode(b.companyCode); const companyName=String(b.companyName||"").trim().slice(0,60); const password=String(b.password||"");
       if(companyCode.length<3 || companyName.length<2 || password.length<6) return json({error:"公司代號至少3碼、公司名稱至少2字、密碼至少6碼"},400);
