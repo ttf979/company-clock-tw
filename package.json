@@ -1,0 +1,8 @@
+{
+  "name":"company-clock",
+  "private":true,
+  "type":"module",
+  "scripts":{"dev":"netlify dev"},
+  "dependencies":{"@netlify/blobs":"latest","@netlify/functions":"latest"},
+  "devDependencies":{"netlify-cli":"latest"}
+}
